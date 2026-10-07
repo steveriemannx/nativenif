@@ -346,10 +346,15 @@ proc setupLinuxA64Entry(ctx: var GenContext) =
 proc setupTls(ctx: var GenContext) =
   ## nifasm owns the per-thread TLS. After every bundled tvar has an FS offset
   ## (`ctx.tlsOffset`), reserve the unified `arkham.tls.0` block in `.bss` (sized
-  ## for all modules' tvars) and synthesize the entry prologue that points FS at it
-  ## via `arch_prctl(ARCH_SET_FS, &arkham.tls.0)`, then jumps to the real entry.
+  ## for all modules' tvars) and synthesize the FS prologue that points FS at it
+  ## via `arch_prctl(ARCH_SET_FS, &arkham.tls.0)` / `sysarch(AMD64_SET_FSBASE, …)`.
   ## Nim thread-locals have no initializers, so the block is just zeroed `.bss`.
   ## x86-64 only (AArch64 TLS uses a different mechanism, not yet implemented).
+  ##
+  ## The prologue does NOT jump to the real entry: it falls through into
+  ## `setupX64ArgsEntry`, which loads argc/argv/envp and makes that jump. The split
+  ## exists because the FS prologue needs thread-locals and is therefore optional,
+  ## while the argument setup is needed by every image.
   const ArchSetFs = 0x1002      # arch_prctl(2) ARCH_SET_FS
   const ArchPrctlNr = 158       # x86-64 syscall number for arch_prctl
   const Amd64SetFsbase = 129    # FreeBSD sysarch(2) AMD64_SET_FSBASE
@@ -370,6 +375,13 @@ proc setupTls(ctx: var GenContext) =
   # Synthesize the FS-setup prologue at the end of .text — it becomes the ELF entry
   # (see writeElf) and tail-jumps to the program's real entry proc.
   ctx.entryStubOffset = ctx.buf.data.len
+  if ctx.target.os == TargetOS.FreeBSD:
+    # FreeBSD enters the image with the argument block pointer in %rdi (see
+    # `setupX64ArgsEntry`), and the FS prologue below overwrites both %rdi
+    # (sysarch's op) and %rsi (the block address). Park it in %r8 — neither the
+    # prologue nor `syscall` (rcx/r11) touches that. This is the stub's first
+    # instruction, so it must follow `entryStubOffset` above.
+    x86.emitMov(ctx.buf.data, x86.R8, x86.RDI)
   let pos = x86.emitLeaRipPlaceholder(ctx.buf, x86.RSI)     # lea rsi, [rip+arkham.tls.0]
   ctx.gvarSites.add (pos, ctx.tlsBlockSym)
   # The self-pointer at offset 0: the block records where it is, so `&threadvar`
@@ -387,14 +399,49 @@ proc setupTls(ctx: var GenContext) =
     x86.emitMovImmToReg(ctx.buf.data, x86.RDI, ArchSetFs)
     x86.emitMovImmToReg(ctx.buf.data, x86.RAX, ArchPrctlNr)
   x86.emitSyscall(ctx.buf.data)                             # arch_prctl / sysarch
-  # Hand the kernel-provided argc/argv to `main(argc, argv)` the way a C crt0 would.
-  # At process entry the SysV ABI puts argc at [rsp] and argv[0] at [rsp+8] (NOT in
-  # rdi/rsi — the kernel zeroes the registers), and the prologue above leaves rsp
-  # untouched. main's full signature takes argc in rdi (param 0) and argv in rsi
-  # (param 1); without this they were garbage, so `cmdCount`/`cmdLine` stayed 0 and
-  # `paramCount()` returned -1 (every `paramStr` was empty).
-  x86.emitMov(ctx.buf.data, x86.RDI, x86.MemoryOperand(base: x86.RSP))            # rdi = argc
-  x86.emitLea(ctx.buf.data, x86.RSI, x86.MemoryOperand(base: x86.RSP, displacement: 8'i32))  # rsi = &argv[0]
+  # Falls through into `setupX64ArgsEntry`, which loads argc/argv/envp and
+  # tail-jumps to the program's real entry. The two are separate because the FS
+  # prologue is optional (a program with no tvars has none) while the argument
+  # setup never is.
+
+proc setupX64ArgsEntry(ctx: var GenContext) =
+  ## Synthesize the x86-64 ELF entry's argument loader — the counterpart of
+  ## `setupLinuxA64Entry`, and the reason the stub exists at all on a program
+  ## with no thread-locals.
+  ##
+  ## It is emitted for EVERY x86-64 image, TLS prologue or not: it is the only
+  ## place the kernel-provided argc/argv/envp reach `main.0`, whose signature is
+  ## `main(argc, argv, envp)` and which stores them into the `cmdCount`/`cmdLine`/
+  ## `nimEnviron` globals that `std/cmdline` and `std/envvars` are built on.
+  ##
+  ## The two x86-64 kernels do NOT agree on where those live:
+  ##
+  ## * Linux follows the SysV ABI: at process entry argc is at `[rsp]` and argv[0]
+  ##   at `[rsp+8]`, and the registers are zeroed.
+  ## * FreeBSD enters the image with `%rdi` pointing AT the argument block, which is
+  ##   what crt1.o reads — `movslq (%rdi),%rax`, `lea 0x8(%rdi),%rsi`,
+  ##   `lea 0x10(%rdi,%rax,8),%rdx`. `%rsp` is NOT usable there: the kernel pads the
+  ##   stack with a zero word whenever the alignment it wants requires one, pushing
+  ##   argc one word down. Reading `(%rsp)` then gave 0, so `cmdCount` stayed 0 and
+  ##   `paramCount()` returned -1 — and only on some runs, since whether the padding
+  ##   is inserted depends on the randomized stack address. It made a native FreeBSD
+  ##   self-host die in stage 2 with "too few command line arguments", and never
+  ##   showed up when compiling hello, which does not use argv.
+  if ctx.target.cpu != Cpu.Amd64 or
+     ctx.target.os notin {TargetOS.Linux, TargetOS.FreeBSD} or
+     ctx.entrySym == nil: return
+  # With no TLS prologue ahead of us this IS the start of the stub; with one the
+  # prologue already set it and falls through to here.
+  if ctx.entryStubOffset < 0: ctx.entryStubOffset = ctx.buf.data.len
+  if ctx.target.os == TargetOS.FreeBSD:
+    # argv must be taken BEFORE rdi is overwritten with argc when the block pointer
+    # is still in rdi (no TLS prologue); with one it was parked in r8.
+    let argBlock = if ctx.tlsOffset != 0 and ctx.tlsBlockSym != nil: x86.R8 else: x86.RDI
+    x86.emitLea(ctx.buf.data, x86.RSI, x86.MemoryOperand(base: argBlock, displacement: 8'i32))  # rsi = &argv[0]
+    x86.emitMov(ctx.buf.data, x86.RDI, x86.MemoryOperand(base: argBlock))                       # rdi = argc
+  else:
+    x86.emitMov(ctx.buf.data, x86.RDI, x86.MemoryOperand(base: x86.RSP))            # rdi = argc
+    x86.emitLea(ctx.buf.data, x86.RSI, x86.MemoryOperand(base: x86.RSP, displacement: 8'i32))  # rsi = &argv[0]
   # main's 3rd arg (rdx) = the environment block. After argv[0..argc-1] and the NULL
   # terminator, the kernel lays out `envp` at `&argv[argc+1]`. With rdi=argc and
   # rsi=&argv[0]: `envp = rsi + 8*(argc+1) = rsi + 8*argc + 8`. (genMainProc stores
@@ -659,6 +706,7 @@ proc assemble*(filename, outfile: string; symMap = false; emitObj = false;
     # A relocatable object has no entry stub: crt's `_start` calls `main`, and
     # libc, not nifasm, points the thread pointer at the static TLS block.
     setupTls(ctx)
+    setupX64ArgsEntry(ctx)
     setupLinuxA64Entry(ctx)
     # Nor a TLS directory or a PE entry: on Windows the crt owns both (`_tls_used`,
     # `_tls_index`; `mainCRTStartup`), and the object supplies a `main` for it.
